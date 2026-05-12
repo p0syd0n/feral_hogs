@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hog Simulation</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: #0a0a0f;
+      overflow: hidden;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #info {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      color: rgba(255, 255, 255, 0.55);
+      font-family: monospace;
+      font-size: 13px;
+      pointer-events: none;
+      line-height: 1.8;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="info">
+    Left drag: rotate &nbsp;|&nbsp; Right drag: pan &nbsp;|&nbsp; Scroll: zoom<br>
+    Hold 1–9 + click: place avoidance &nbsp;|&nbsp; q + 1–9 + click: set agriculture<br>
+    p + click: spawn 10 hogs &nbsp;|&nbsp; p + 1–9 + click: spawn N×10 hogs<br>
+    Hogs: <span id="hogCount">0</span>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r134/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.134/examples/js/controls/OrbitControls.js"></script>
+
+  <script>
+    // ─────────────────────────────────────────────────────────────
+    // CONSTANTS
+    // ─────────────────────────────────────────────────────────────
+
+    const SEGMENTS_X = 100;
+    const SEGMENTS_Y = 100;
+    const PLANE_WIDTH = 10;
+    const PLANE_HEIGHT = 10;
+
+    const DAY_DURATION = 2000;
+    const TARGET_FPS = 30;
+
+    const INITIAL_HOGS = 150;
+    const MAX_HOGS = 600;
+
+    const BASE_SPEED = 5;
+    const NEAREST_N = 5;
+    const CROWD_RADIUS = 8;
+    const AVOID_RADIUS = 15;        // grid cells — sensing radius for danger
+    const AVOID_SPLOTCH = 8;         // grid cells — radius of a placed splotch
+
+    const GROUP_WEIGHT = 1.0;
+    const AGRI_WEIGHT = 1.5;
+    const AVOID_WEIGHT = 5.0;
+    const CROWD_WEIGHT = 2.5;
+
+    const WANDER_CHANCE = 0.05;
+    const WANDER_LOW = 0.15;
+    const WANDER_HIGH_MIN = 2.0;
+    const WANDER_HIGH_MAX = 6.0;
+
+    const MAX_FAT_CHANGE = 0.08;
+
+    const MAX_BIRTH_DEATH_RATIO = 1.05;
+    const BIRTH_RATE = 1 / 12;
+    const NATURAL_DEATH_RATE = BIRTH_RATE / MAX_BIRTH_DEATH_RATIO;
+
+    // ─────────────────────────────────────────────────────────────
+    // GLOBALS
+    // ─────────────────────────────────────────────────────────────
+    let hogPositions;
+    let agriculture;
+    let toAvoid;
+    let agGradX, agGradY;
+    let hogs = [];
+
+    // ─────────────────────────────────────────────────────────────
+    // HOG CLASS
+    // ─────────────────────────────────────────────────────────────
+    class Hog {
+      constructor(position) {
+        this.col = position.x;
+        this.row = position.y;
+        this.fatness = 0.35 + Math.random() * 0.35;
+        this.direction = { dx: 0, dy: 0 };
+        const c = Math.round(this.col), r = Math.round(this.row);
+        hogPositions[c][r].push(this);
+        hogs.push(this);
+      }
+
+      calculateDirection() {
+        const c = Math.round(this.col);
+        const r = Math.round(this.row);
+
+        // ── Agriculture gradient (precomputed) ──
+        const agdx = agGradX[c][r];
+        const agdy = agGradY[c][r];
+        const agMag = Math.hypot(agdx, agdy) || 1;
+
+        // ── Avoidance: radius search, flee from all nearby danger ──
+        // For every node within AVOID_RADIUS that has V > 0,
+        // accumulate a flee vector (away from node) weighted by V/dist.
+        // This gives nonzero repulsion at any distance up to AVOID_RADIUS,
+        // not just at the boundary of a gradient.
+        let avdx = 0, avdy = 0;
+        const c0 = Math.max(0, c - AVOID_RADIUS);
+        const c1 = Math.min(SEGMENTS_X, c + AVOID_RADIUS);
+        const r0 = Math.max(0, r - AVOID_RADIUS);
+        const r1 = Math.min(SEGMENTS_Y, r + AVOID_RADIUS);
+        for (let nc = c0; nc <= c1; nc++) {
+          for (let nr = r0; nr <= r1; nr++) {
+            const v = toAvoid[nc][nr];
+            if (v === 0) continue;
+            const fdx = c - nc;   // direction: danger node → hog (flee)
+            const fdy = r - nr;
+            const dist = Math.hypot(fdx, fdy) || 1;
+            if (dist > AVOID_RADIUS) continue;
+            avdx += (fdx / dist) * (v / dist);
+            avdy += (fdy / dist) * (v / dist);
+          }
+        }
+        const avMag = Math.hypot(avdx, avdy) || 1;
+        // avNx/avNy are zero when no danger is nearby (avdx=avdy=0 → avMag→1 via ||1)
+        const avNx = avdx / avMag;
+        const avNy = avdy / avMag;
+
+        // ── Neighbour sort (shared for pack cohesion + crowd dispersal) ──
+        const others = [];
+        for (let i = 0; i < hogs.length; i++) {
+          const h = hogs[i];
+          if (h === this) continue;
+          const dx = h.col - this.col;
+          const dy = h.row - this.row;
+          others.push({ dx, dy, dist: Math.hypot(dx, dy) });
+        }
+        others.sort((a, b) => a.dist - b.dist);
+
+        // Pack cohesion (nearest NEAREST_N)
+        let gdx = 0, gdy = 0;
+        const packSize = Math.min(NEAREST_N, others.length);
+        for (let i = 0; i < packSize; i++) {
+          const { dx, dy, dist } = others[i];
+          const m = dist || 1;
+          gdx += dx / m;
+          gdy += dy / m;
+        }
+        const gMag = Math.hypot(gdx, gdy) || 1;
+        const gx = packSize ? gdx / gMag : 0;
+        const gy = packSize ? gdy / gMag : 0;
+
+        // Crowd dispersal (beyond pack, within CROWD_RADIUS)
+        let cdx = 0, cdy = 0, crowdCount = 0;
+        for (let i = NEAREST_N; i < others.length; i++) {
+          const { dx, dy, dist } = others[i];
+          if (dist > CROWD_RADIUS) break;
+          const m = dist || 1;
+          cdx -= dx / m;
+          cdy -= dy / m;
+          crowdCount++;
+        }
+        const cMag = Math.hypot(cdx, cdy) || 1;
+        const cx = crowdCount ? cdx / cMag : 0;
+        const cy = crowdCount ? cdy / cMag : 0;
+        const crowdStrength = Math.min(crowdCount / (NEAREST_N + 1), 3.0);
+
+        // Wander
+        const wanderAngle = Math.random() * Math.PI * 2;
+        const wanderW = Math.random() < WANDER_CHANCE
+          ? WANDER_HIGH_MIN + Math.random() * (WANDER_HIGH_MAX - WANDER_HIGH_MIN)
+          : Math.random() * WANDER_LOW;
+
+        // Weighted sum
+        const agriW = AGRI_WEIGHT * (2 - this.fatness);
+        const crowdW = CROWD_WEIGHT * crowdStrength;
+
+        const dx = gx * GROUP_WEIGHT
+          + (agdx / agMag) * agriW
+          + avNx * AVOID_WEIGHT
+          + cx * crowdW
+          + Math.cos(wanderAngle) * wanderW;
+        const dy = gy * GROUP_WEIGHT
+          + (agdy / agMag) * agriW
+          + avNy * AVOID_WEIGHT
+          + cy * crowdW
+          + Math.sin(wanderAngle) * wanderW;
+
+        const mag = Math.hypot(dx, dy) || 1;
+        this.direction = { dx: dx / mag, dy: dy / mag };
+      }
+
+      move(deltaDay) {
+        const speed = BASE_SPEED * (1 - this.fatness * 0.5) * deltaDay;
+        const oldC = Math.round(this.col);
+        const oldR = Math.round(this.row);
+
+        this.col = Math.max(0, Math.min(SEGMENTS_X, this.col + this.direction.dx * speed));
+        this.row = Math.max(0, Math.min(SEGMENTS_Y, this.row + this.direction.dy * speed));
+
+        const newC = Math.round(this.col);
+        const newR = Math.round(this.row);
+        if (newC !== oldC || newR !== oldR) {
+          const src = hogPositions[oldC][oldR];
+          const idx = src.indexOf(this);
+          if (idx !== -1) src.splice(idx, 1);
+          hogPositions[newC][newR].push(this);
+        }
+      }
+
+      potentialDeath(deltaDay) {
+        const c = Math.round(this.col);
+        const r = Math.round(this.row);
+        const a = agriculture[c][r];
+
+        this.fatness = Math.max(0, Math.min(1,
+          this.fatness + (a - 0.5) * 2 * MAX_FAT_CHANGE * deltaDay
+        ));
+
+        if (this.fatness <= 0) { this.die(); return; }
+
+        if (Math.random() < NATURAL_DEATH_RATE * deltaDay) { this.die(); }
+      }
+
+      reproduce(deltaDay) {
+        if (hogs.length >= MAX_HOGS) return;
+        if (Math.random() < BIRTH_RATE * deltaDay) {
+          const child = new Hog({ x: Math.round(this.col), y: Math.round(this.row) });
+          child.fatness = Math.min(1, (this.fatness + 0.5) / 2);
+        }
+      }
+
+      die() {
+        const c = Math.round(this.col);
+        const r = Math.round(this.row);
+        const arr = hogPositions[c][r];
+        const ai = arr.indexOf(this);
+        if (ai !== -1) arr.splice(ai, 1);
+        const hi = hogs.indexOf(this);
+        if (hi !== -1) hogs.splice(hi, 1);
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // THREE.JS SETUP
+    // ─────────────────────────────────────────────────────────────
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a0f);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, -12, 8);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+
+    // ─────────────────────────────────────────────────────────────
+    // INITIALIZE GRIDS
+    // ─────────────────────────────────────────────────────────────
+    hogPositions = Array.from({ length: SEGMENTS_X + 1 },
+      () => Array.from({ length: SEGMENTS_Y + 1 }, () => []));
+
+    agriculture = Array.from({ length: SEGMENTS_X + 1 }, () => new Float32Array(SEGMENTS_Y + 1));
+    for (let w = 0; w < 8; w++) {
+      const fx = (Math.random() - 0.5) * 0.18;
+      const fy = (Math.random() - 0.5) * 0.18;
+      const phase = Math.random() * Math.PI * 2;
+      for (let c = 0; c <= SEGMENTS_X; c++)
+        for (let r = 0; r <= SEGMENTS_Y; r++)
+          agriculture[c][r] += Math.cos(c * fx + r * fy + phase);
+    }
+    let agMin = Infinity, agMax = -Infinity;
+    for (let c = 0; c <= SEGMENTS_X; c++)
+      for (let r = 0; r <= SEGMENTS_Y; r++) {
+        if (agriculture[c][r] < agMin) agMin = agriculture[c][r];
+        if (agriculture[c][r] > agMax) agMax = agriculture[c][r];
+      }
+    const agRange = agMax - agMin || 1;
+    for (let c = 0; c <= SEGMENTS_X; c++)
+      for (let r = 0; r <= SEGMENTS_Y; r++)
+        agriculture[c][r] = (agriculture[c][r] - agMin) / agRange;
+
+    agGradX = Array.from({ length: SEGMENTS_X + 1 }, () => new Float32Array(SEGMENTS_Y + 1));
+    agGradY = Array.from({ length: SEGMENTS_X + 1 }, () => new Float32Array(SEGMENTS_Y + 1));
+    for (let c = 0; c <= SEGMENTS_X; c++)
+      for (let r = 0; r <= SEGMENTS_Y; r++) {
+        agGradX[c][r] = agriculture[Math.min(c + 1, SEGMENTS_X)][r] - agriculture[Math.max(c - 1, 0)][r];
+        agGradY[c][r] = agriculture[c][Math.min(r + 1, SEGMENTS_Y)] - agriculture[c][Math.max(r - 1, 0)];
+      }
+
+    toAvoid = Array.from({ length: SEGMENTS_X + 1 }, () => new Float32Array(SEGMENTS_Y + 1));
+
+    // ─────────────────────────────────────────────────────────────
+    // GEOMETRY
+    // ─────────────────────────────────────────────────────────────
+    const geometry = new THREE.PlaneGeometry(PLANE_WIDTH, PLANE_HEIGHT, SEGMENTS_X, SEGMENTS_Y);
+    const positions = geometry.attributes.position;
+    const colorData = new Float32Array(positions.count * 3);
+
+    function getZ(col, row) {
+      return hogPositions[col][row].length * 0.4;
+    }
+
+    function getColor(col, row) {
+      const a = agriculture[col][row];
+      const v = toAvoid[col][row];
+      // Agriculture base: red (0) → yellow (0.5) → green (1)
+      let r = a < 0.5 ? 1.0 : 2.0 * (1.0 - a);
+      let g = a < 0.5 ? 2.0 * a : 1.0;
+      // Blend toward blue as avoidance increases
+      r = r * (1 - v);
+      g = g * (1 - v);
+      const b = v;
+      return [r, g, b];
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // AVOIDANCE PLACEMENT
+    // ─────────────────────────────────────────────────────────────
+    function placeAvoidance(col, row, value) {
+      for (let dc = -AVOID_SPLOTCH; dc <= AVOID_SPLOTCH; dc++) {
+        for (let dr = -AVOID_SPLOTCH; dr <= AVOID_SPLOTCH; dr++) {
+          const nc = col + dc;
+          const nr = row + dr;
+          if (nc < 0 || nc > SEGMENTS_X || nr < 0 || nr > SEGMENTS_Y) continue;
+          const dist = Math.hypot(dc, dr);
+          if (dist > AVOID_SPLOTCH) continue;
+          const falloff = 1 - dist / AVOID_SPLOTCH;
+          toAvoid[nc][nr] = Math.min(1, toAvoid[nc][nr] + value * falloff);
+        }
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // AGRICULTURE PLACEMENT
+    // ─────────────────────────────────────────────────────────────
+    function placeAgriculture(col, row, value) {
+      for (let dc = -AVOID_SPLOTCH; dc <= AVOID_SPLOTCH; dc++) {
+        for (let dr = -AVOID_SPLOTCH; dr <= AVOID_SPLOTCH; dr++) {
+          const nc = col + dc;
+          const nr = row + dr;
+          if (nc < 0 || nc > SEGMENTS_X || nr < 0 || nr > SEGMENTS_Y) continue;
+          const dist = Math.hypot(dc, dr);
+          if (dist > AVOID_SPLOTCH) continue;
+          const falloff = 1 - dist / AVOID_SPLOTCH;
+          agriculture[nc][nr] = Math.min(1, Math.max(0,
+            agriculture[nc][nr] + (value - agriculture[nc][nr]) * falloff
+          ));
+          // Recompute gradient at affected node
+          agGradX[nc][nr] = agriculture[Math.min(nc + 1, SEGMENTS_X)][nr] - agriculture[Math.max(nc - 1, 0)][nr];
+          agGradY[nc][nr] = agriculture[nc][Math.min(nr + 1, SEGMENTS_Y)] - agriculture[nc][Math.max(nr - 1, 0)];
+        }
+      }
+    }
+
+    function spawnHogs(col, row, count) {
+      for (let i = 0; i < count; i++) {
+        if (hogs.length >= MAX_HOGS) break;
+        // Scatter spawns within a small radius around the click
+        const angle = Math.random() * Math.PI * 2;
+        const radius = Math.random() * AVOID_SPLOTCH * 0.5;
+        const nc = Math.round(Math.max(0, Math.min(SEGMENTS_X, col + Math.cos(angle) * radius)));
+        const nr = Math.round(Math.max(0, Math.min(SEGMENTS_Y, row + Math.sin(angle) * radius)));
+        new Hog({ x: nc, y: nr });
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // INTERACTION: hold number key + click to paint avoidance
+    // ─────────────────────────────────────────────────────────────
+    let heldKey = [];
+    window.addEventListener('keydown', e => { heldKey.push(e.key); });
+    window.addEventListener('keyup', e => { heldKey = heldKey.filter(n => n != e.key); });
+
+    const pickPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+    const raycaster = new THREE.Raycaster();
+    const pickTarget = new THREE.Vector3();
+
+    renderer.domElement.addEventListener('click', e => {
+      const num = (() => {
+        for (const key of heldKey) {
+          const n = parseInt(key);
+          if (!isNaN(n) && n >= 1 && n <= 9) return n;
+        }
+        return NaN;
+      })();
+
+      const rect = renderer.domElement.getBoundingClientRect();
+      const mouse = new THREE.Vector2(
+        ((e.clientX - rect.left) / rect.width) * 2 - 1,
+        -((e.clientY - rect.top) / rect.height) * 2 + 1
+      );
+      raycaster.setFromCamera(mouse, camera);
+      if (!raycaster.ray.intersectPlane(pickPlane, pickTarget)) return;
+
+      const col = Math.round((pickTarget.x + PLANE_WIDTH / 2) / PLANE_WIDTH * SEGMENTS_X);
+      const row = Math.round((PLANE_HEIGHT / 2 - pickTarget.y) / PLANE_HEIGHT * SEGMENTS_Y);
+      if (col < 0 || col > SEGMENTS_X || row < 0 || row > SEGMENTS_Y) return;
+
+      if (heldKey.includes('p')) {
+        const count = isNaN(num) ? 10 : num * 10;
+        spawnHogs(col, row, count);
+      } else if (isNaN(num)) {
+        return;
+      } else if (heldKey.includes('q')) {
+        placeAgriculture(col, row, num * 0.1);
+      } else {
+        placeAvoidance(col, row, num * 0.1);
+      }
+    });
+
+    // ─────────────────────────────────────────────────────────────
+    // SPAWN INITIAL HOGS
+    // ─────────────────────────────────────────────────────────────
+    for (let i = 0; i < INITIAL_HOGS; i++) {
+      new Hog({
+        x: Math.floor(Math.random() * (SEGMENTS_X + 1)),
+        y: Math.floor(Math.random() * (SEGMENTS_Y + 1))
+      });
+    }
+
+    // Initial geometry pass
+    {
+      let col = 0, row = 0;
+      for (let i = 0; i < positions.count; i++) {
+        positions.setZ(i, getZ(col, row));
+        const [r, g, b] = getColor(col, row);
+        colorData[i * 3] = r; colorData[i * 3 + 1] = g; colorData[i * 3 + 2] = b;
+        if (++col > SEGMENTS_X) { col = 0; row++; }
+      }
+    }
+    positions.needsUpdate = true;
+    geometry.computeVertexNormals();
+    geometry.setAttribute('color', new THREE.BufferAttribute(colorData, 3));
+
+    scene.add(new THREE.Mesh(geometry, new THREE.MeshPhongMaterial({
+      vertexColors: true, side: THREE.DoubleSide, shininess: 60
+    })));
+    scene.add(new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
+      color: 0xffffff, wireframe: true, transparent: true, opacity: 0.04
+    })));
+
+    // Lighting
+    scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+    sun.position.set(5, 5, 10);
+    scene.add(sun);
+    const fill = new THREE.DirectionalLight(0x8888ff, 0.3);
+    fill.position.set(-5, -5, -5);
+    scene.add(fill);
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ─────────────────────────────────────────────────────────────
+    // RENDER LOOP
+    // ─────────────────────────────────────────────────────────────
+    const hogCountEl = document.getElementById('hogCount');
+    let lastTime = 0;
+
+    function animate(timestamp) {
+      requestAnimationFrame(animate);
+
+      const elapsed = timestamp - lastTime;
+      if (elapsed < 1000 / TARGET_FPS) return;
+      lastTime = timestamp - (elapsed % (1000 / TARGET_FPS));
+
+      const deltaDay = elapsed / DAY_DURATION;
+
+      const snapshot = hogs.slice();
+      for (const hog of snapshot) hog.calculateDirection();
+      for (const hog of snapshot) hog.move(deltaDay);
+      for (const hog of hogs.slice()) hog.potentialDeath(deltaDay);
+      for (const hog of hogs.slice()) hog.reproduce(deltaDay);
+
+      let col = 0, row = 0;
+      for (let i = 0; i < positions.count; i++) {
+        positions.setZ(i, getZ(col, row));
+        const [r, g, b] = getColor(col, row);
+        colorData[i * 3] = r; colorData[i * 3 + 1] = g; colorData[i * 3 + 2] = b;
+        if (++col > SEGMENTS_X) { col = 0; row++; }
+      }
+      positions.needsUpdate = true;
+      geometry.attributes.color.needsUpdate = true;
+      geometry.computeVertexNormals();
+
+      hogCountEl.textContent = hogs.length;
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    animate(0);
+  </script>
+</body>
+
+</html>

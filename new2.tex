@@ -1,0 +1,413 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{parskip}
+
+\geometry{margin=1.1in}
+
+\title{\textbf{Hog Population Simulation: Model Description}}
+\date{}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+\bigskip
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{World Representation}
+
+The simulation world is a discrete grid of $(S_x + 1) \times (S_y + 1)$ nodes, with
+$S_x = S_y = 100$.  Every scalar field in the model---agriculture, avoidance,
+hog density---is stored at these nodes and indexed by integer column $c$ and
+row $r$, with $0 \le c \le S_x$ and $0 \le r \le S_y$.
+
+Each hog carries a continuous position $(x, y) \in [0, S_x] \times [0, S_y]$;
+the nearest-integer rounding $c = \mathrm{round}(x)$, $r = \mathrm{round}(y)$
+is used whenever a grid-node value is looked up.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Static Fields}
+
+\subsection{Agriculture, $A(c,r)$}
+
+Agriculture encodes local food availability.  It is generated once at
+initialisation as a superposition of $W = 8$ random cosine waves:
+
+\[
+  A_{\mathrm{raw}}(c,r)
+  \;=\; \sum_{w=1}^{W}
+        \cos\!\bigl(c\,f_x^{(w)} + r\,f_y^{(w)} + \varphi^{(w)}\bigr),
+\]
+
+where each spatial frequency $f_x^{(w)}, f_y^{(w)} \sim \mathrm{Uniform}(-0.09,\,0.09)$
+and each phase $\varphi^{(w)} \sim \mathrm{Uniform}(0, 2\pi)$.  The raw field is
+then min-max normalised:
+
+\[
+  A(c,r) \;=\; \frac{A_{\mathrm{raw}}(c,r) - \min A_{\mathrm{raw}}}
+                    {\max A_{\mathrm{raw}} - \min A_{\mathrm{raw}}}
+  \;\in\; [0,\,1].
+\]
+
+The superposition of low-frequency cosines produces smooth, blob-like spatial
+variation without sharp discontinuities.
+
+\subsection{Agriculture Gradient}
+
+Because hogs steer toward increasing food, the spatial gradient of $A$ is
+precomputed once via central differences:
+
+\[
+  \nabla_c A(c,r)
+    = A(\min(c{+}1, S_x),\, r) - A(\max(c{-}1,0),\, r),
+\]
+\[
+  \nabla_r A(c,r)
+    = A(c,\, \min(r{+}1, S_y)) - A(c,\, \max(r{-}1,0)).
+\]
+
+Because $A$ is static, this computation is performed only at startup.
+
+\subsection{Avoidance Field, $V(c,r)$}
+
+An avoidance field $V(c,r) \in [0,1]$ encodes locations that hogs should avoid
+(e.g.\ human infrastructure, hunting zones).  Unlike agriculture, avoidance is
+not used via its gradient.  Instead, hogs sense danger through a direct
+radius search described in Section~\ref{sec:avoid_dir}, which produces a
+repulsive flee direction that is nonzero at any distance up to $R_{\mathrm{avoid}}$
+from a hazard.  A gradient-based approach would produce a nonzero signal only
+at the immediate boundary between zero and nonzero cells, making it effectively
+inactive for a field that is mostly zero.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Hog State}
+
+Each hog $i$ is described by:
+
+\begin{itemize}
+  \item \textbf{Position} $(x_i, y_i) \in [0, S_x] \times [0, S_y]$, continuous.
+  \item \textbf{Fatness} $\phi_i \in [0, 1]$, a proxy for energy reserves.
+  \item \textbf{Direction} $(\hat{d}_{x,i},\, \hat{d}_{y,i})$, a unit vector
+        computed each time-step before any hog is moved.
+\end{itemize}
+
+At initialisation, fatness is drawn uniformly from $[0.35,\, 0.70]$ and hogs
+are placed at grid nodes drawn uniformly at random.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Direction Calculation}
+
+The direction of hog $i$ is the normalised weighted sum of four deterministic
+components---pack cohesion, food-seeking, threat avoidance, and crowd
+dispersal---plus a stochastic wander term.
+
+\subsection{Pack Cohesion}
+
+Let $\mathcal{N}_i$ be the set of the $N_{\mathrm{pack}} = 5$ nearest
+neighbours of hog $i$.  The cohesion direction is
+
+\[
+  \mathbf{g}_i = \frac{\tilde{\mathbf{g}}_i}{\|\tilde{\mathbf{g}}_i\|},
+  \qquad
+  \tilde{\mathbf{g}}_i
+    = \sum_{j \in \mathcal{N}_i} \frac{\mathbf{p}_j - \mathbf{p}_i}
+                                      {\|\mathbf{p}_j - \mathbf{p}_i\|},
+\]
+
+where $\mathbf{p}_k = (x_k, y_k)$.  Normalising each pairwise displacement
+before summing gives each neighbour equal angular vote regardless of distance,
+so a single distant outlier does not dominate.
+
+\subsection{Food-Seeking}
+
+The food-seeking direction is the normalised agriculture gradient at the hog's
+current node:
+
+\[
+  \mathbf{a}_i
+    = \frac{\nabla A(c_i, r_i)}{\|\nabla A(c_i, r_i)\|}.
+\]
+
+Hogs that are hungrier (lower $\phi_i$) weight this component more heavily;
+see Section~\ref{sec:weights}.
+
+\subsection{Threat Avoidance}
+\label{sec:avoid_dir}
+
+The flee direction is computed by a radius search over all grid nodes within
+$R_{\mathrm{avoid}}$ cells that carry nonzero avoidance.  Each such node
+contributes a unit vector pointing away from it, weighted by $V / \mathrm{dist}$
+so that closer and stronger hazards exert greater influence:
+
+\[
+  \tilde{\mathbf{f}}_i
+    = \sum_{\substack{(n_c,\, n_r):\\ \delta \;\leq\; R_{\mathrm{avoid}} \\[2pt] V(n_c,n_r) > 0}}
+      \frac{(c_i - n_c,\; r_i - n_r)}{\delta}
+      \cdot \frac{V(n_c, n_r)}{\delta},
+  \qquad
+  \delta = \bigl\|(c_i - n_c,\; r_i - n_r)\bigr\|,
+\]
+
+\[
+  \mathbf{f}_i = \frac{\tilde{\mathbf{f}}_i}{\|\tilde{\mathbf{f}}_i\|}.
+\]
+
+When no hazard exists within $R_{\mathrm{avoid}}$, $\tilde{\mathbf{f}}_i = \mathbf{0}$
+and the term contributes nothing to the direction sum.
+
+\subsection{Crowd Dispersal}
+
+Let $\mathcal{C}_i$ be the set of all hogs within radius $R_{\mathrm{crowd}} = 8$
+grid cells \emph{excluding} the $N_{\mathrm{pack}}$ nearest neighbours.  The
+dispersal direction pushes hog $i$ away from the crowd centroid:
+
+\[
+  \tilde{\mathbf{c}}_i
+    = -\sum_{j \in \mathcal{C}_i}
+        \frac{\mathbf{p}_j - \mathbf{p}_i}{\|\mathbf{p}_j - \mathbf{p}_i\|},
+  \qquad
+  \mathbf{c}_i = \frac{\tilde{\mathbf{c}}_i}{\|\tilde{\mathbf{c}}_i\|}.
+\]
+
+The severity of crowd pressure is
+
+\[
+  \sigma_i = \min\!\left(\frac{|\mathcal{C}_i|}{N_{\mathrm{pack}} + 1},\; 3\right),
+\]
+
+which grows with crowd size and saturates at 3.  Division by
+$N_{\mathrm{pack}} + 1$ sets the scale: a crowd equal in number to the pack
+produces $\sigma = 1$, a crowd twice as large produces $\sigma = 2$, and so on.
+
+\subsection{Wander}
+
+A stochastic impulse $\mathbf{w}_i = (\cos\theta,\,\sin\theta)$ with
+$\theta \sim \mathrm{Uniform}(0, 2\pi)$ is added at each step.  Its weight
+is drawn as:
+
+\[
+  w_{\mathrm{wander}} =
+  \begin{cases}
+    \mathrm{Uniform}(W_{\mathrm{hi,min}},\, W_{\mathrm{hi,max}})
+      & \text{with probability } p_{\mathrm{wander}} = 0.05,\\[4pt]
+    \mathrm{Uniform}(0,\, W_{\mathrm{lo}})
+      & \text{otherwise.}
+  \end{cases}
+\]
+
+In the triggered case the weight can reach $W_{\mathrm{hi,max}} = 6$, which
+can overpower all deterministic components and cause sudden re-orientation.
+In the quiet case the weight is at most $W_{\mathrm{lo}} = 0.15$, acting as
+negligible noise.
+
+\subsection{Weighted Combination}
+\label{sec:weights}
+
+The raw direction vector is
+
+\begin{equation}
+\label{eq:direction}
+  \tilde{\mathbf{d}}_i
+    = W_g\,\mathbf{g}_i
+    + W_a(\phi_i)\,\mathbf{a}_i
+    + W_v\,\mathbf{f}_i
+    + W_c\,\sigma_i\,\mathbf{c}_i
+    + w_{\mathrm{wander}}\,\mathbf{w}_i,
+\end{equation}
+
+with the hunger-scaled food weight
+
+\[
+  W_a(\phi_i) = W_a\,(2 - \phi_i).
+\]
+
+This doubles the food weight when $\phi_i = 0$ (starving) and reduces it to
+$W_a$ when $\phi_i = 1$ (fully fed).  Because $\mathbf{f}_i = \mathbf{0}$ when
+no danger is within $R_{\mathrm{avoid}}$, the avoidance term is naturally
+inactive in safe territory without requiring an additional multiplier.  The
+final unit direction is
+
+\[
+  (\hat{d}_{x,i}, \hat{d}_{y,i}) = \frac{\tilde{\mathbf{d}}_i}{\|\tilde{\mathbf{d}}_i\|}.
+\]
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Movement}
+
+All hog directions are computed from the same position snapshot before any hog
+is moved (synchronous update).  Hog $i$ then advances by
+
+\[
+  \mathbf{p}_i \;\leftarrow\;
+    \mathrm{clamp}\!\Bigl(
+      \mathbf{p}_i
+      + v(\phi_i)\,\Delta t \cdot (\hat{d}_{x,i}, \hat{d}_{y,i}),
+      \;\mathbf{0},\;(S_x, S_y)
+    \Bigr),
+\]
+
+where the speed is
+
+\[
+  v(\phi_i) = v_0\,\bigl(1 - \tfrac{1}{2}\,\phi_i\bigr),
+  \qquad v_0 = 5 \text{ grid cells day}^{-1}.
+\]
+
+Fatter hogs move at half the base speed.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Fatness Dynamics}
+
+At each time-step, hog $i$'s fatness changes as
+
+\[
+  \phi_i \;\leftarrow\;
+  \mathrm{clamp}\!\Bigl(
+    \phi_i
+    + \bigl(A(c_i,r_i) - 0.5\bigr)\cdot 2\,U\,\Delta t,
+    \;0,\;1
+  \Bigr),
+\]
+
+where $U = 0.08$ day$^{-1}$ is the maximum fat-change rate.  Subtracting 0.5
+recenters the agriculture value so that $A = 0.5$ is neutral; multiplying by 2
+stretches the range to $[-1, 1]$; multiplying by $U$ scales to
+$[-0.08,\, 0.08]$ per day.  At $A = 1$ a hog gains $U$ fat per day; at
+$A = 0$ it loses $U$ per day.  Fatness is hard-capped at 1.  If $\phi_i$
+reaches 0 the hog dies of starvation.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Demography}
+
+\subsection{Natural Mortality}
+
+Each hog faces a constant background death hazard $\mu$ per day:
+
+\[
+  P(\text{death in } \Delta t) = \mu\,\Delta t,
+  \qquad
+  \mu = \frac{\lambda}{R^*},
+\]
+
+where $\lambda$ is the birth rate and $R^* = 1.05$ is the target maximum
+birth-to-death ratio.  The net per-capita growth rate under ideal conditions
+(starvation absent) is
+
+\[
+  \lambda - \mu = \lambda\!\left(1 - \frac{1}{R^*}\right)
+               = \frac{1}{12} \cdot \frac{0.05}{1.05}
+               \approx 0.004 \text{ day}^{-1}.
+\]
+
+Under poor conditions starvation mortality adds to $\mu$ and the population
+contracts.
+
+\subsection{Reproduction}
+
+Each surviving hog reproduces at rate $\lambda = \tfrac{1}{12}$ day$^{-1}$,
+independent of local food conditions.  A birth occurs within $\Delta t$ with
+probability $\lambda\,\Delta t$.  The offspring is placed at the parent's
+current node with initial fatness
+
+\[
+  \phi_{\mathrm{child}} = \frac{\phi_{\mathrm{parent}} + 0.5}{2},
+\]
+
+regressing toward the population mean.  Reproduction is suppressed when the
+total population reaches the hard cap $N_{\mathrm{max}} = 600$.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Time Discretisation}
+
+Simulated time is measured in days.  The real-time day length is
+$T_{\mathrm{day}} = 2000\,\text{ms}$.  Each frame supplies an elapsed
+wall-clock time $\Delta t_{\mathrm{wall}}$ (ms), giving
+
+\[
+  \Delta t = \frac{\Delta t_{\mathrm{wall}}}{T_{\mathrm{day}}}.
+\]
+
+All per-day rates are multiplied by $\Delta t$ before application, producing a
+continuous-time Euler integration that is independent of frame rate.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Summary of Constants}
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+Symbol & Value & Unit & Description \\
+\midrule
+$S_x, S_y$               & 100               & ---              & Grid dimensions \\
+$N_{\mathrm{pop,0}}$     & 150               & hogs             & Initial population \\
+$N_{\mathrm{max}}$       & 600               & hogs             & Population hard cap \\
+$T_{\mathrm{day}}$       & 2000              & ms               & Real-time day length \\
+$v_0$                    & 5                 & cells day$^{-1}$ & Base movement speed \\
+$N_{\mathrm{pack}}$      & 5                 & hogs             & Pack size \\
+$R_{\mathrm{crowd}}$     & 8                 & cells            & Crowd dispersal radius \\
+$R_{\mathrm{avoid}}$     & 15                & cells            & Avoidance sensing radius \\
+$W_g$                    & 1.0               & ---              & Pack cohesion weight \\
+$W_a$                    & 1.5               & ---              & Agriculture weight (base) \\
+$W_v$                    & 2.0               & ---              & Avoidance weight \\
+$W_c$                    & 2.5               & ---              & Crowd dispersal weight \\
+$p_{\mathrm{wander}}$    & 0.05              & ---              & Wander trigger probability \\
+$W_{\mathrm{lo}}$        & 0.15              & ---              & Quiet wander max weight \\
+$W_{\mathrm{hi,min}}$    & 2.0               & ---              & Triggered wander min weight \\
+$W_{\mathrm{hi,max}}$    & 6.0               & ---              & Triggered wander max weight \\
+$U$                      & 0.08              & day$^{-1}$       & Max fat change rate \\
+$\lambda$                & $1/12$            & day$^{-1}$       & Birth rate \\
+$R^*$                    & 1.05              & ---              & Max birth-to-death ratio \\
+$\mu$                    & $\lambda / R^*$   & day$^{-1}$       & Natural death rate \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Implementation Notes}
+
+\subsection{Synchronous Update Order}
+
+Within each time-step the simulation proceeds in four sequential phases:
+(1) all directions are computed from the current position snapshot;
+(2) all hogs are moved;
+(3) vital events (starvation, natural death) are evaluated;
+(4) reproduction is evaluated.
+Separating direction calculation from movement ensures that no hog benefits
+from the updated positions of hogs that moved earlier in the same step.
+
+\subsection{Spatial Index}
+
+A two-dimensional array indexed by $(c, r)$ stores references to all hogs
+whose rounded grid position is that node.  This index is maintained
+incrementally as hogs move.
+
+\subsection{Neighbour Search}
+
+Direction calculation requires the $N_{\mathrm{pack}}$ nearest neighbours and
+the crowd set within $R_{\mathrm{crowd}}$.  Both are obtained from a single
+distance-sorted pass over all hogs.  The crowd loop terminates early once
+distances exceed $R_{\mathrm{crowd}}$.  The avoidance radius search iterates
+over grid nodes in the bounding box $[c - R_{\mathrm{avoid}},\,
+c + R_{\mathrm{avoid}}] \times [r - R_{\mathrm{avoid}},\, r +
+R_{\mathrm{avoid}}]$, skipping nodes where $V = 0$.
+
+\subsection{Avoidance Placement}
+
+Avoidance splotches are painted onto $V$ interactively.  A circular splotch of
+radius $R_{\mathrm{splotch}} = 8$ cells is placed at a clicked grid location,
+with a linear falloff from the specified peak value $v_0 \in (0, 1]$ at the
+centre to zero at the perimeter:
+
+\[
+  V(n_c, n_r) \;\leftarrow\;
+  \min\!\Bigl(1,\; V(n_c, n_r)
+    + v_0\,\Bigl(1 - \frac{\|(n_c - c_0,\, n_r - r_0)\|}{R_{\mathrm{splotch}}}\Bigr)\Bigr),
+\]
+
+for all nodes within $R_{\mathrm{splotch}}$ of the click centre $(c_0, r_0)$.
+Values accumulate additively and are clamped to $[0, 1]$.
+
+\end{document}
